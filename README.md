@@ -3,7 +3,7 @@
 
 ### Changes Made for Our Submision
 
-The files that we edited to test out both the default CNN on emg2qwerty as well as experiment with RNN, RNN+CNN, and CNN+Transformer hybrid architectures include `emg2qwery/lightning.py`, `emg2qwery/modules.py`, and new config files to easily train and test any of the new models under `config/model/`. We have also updated the .ipynb Colab notebook with some, though by no means all, of our training and testing records. 
+The files that we edited to test out both the default CNN on emg2qwerty as well as experiment with RNN, RNN+CNN, and CNN+Transformer hybrid architectures include `emg2qwery/lightning.py`, `emg2qwery/modules.py`, and new config files to easily train and test any of the new models under `config/model/`, along with  `emg2qwery/transforms.py` for our various pre and post-processing experiments. We have also updated the .ipynb Colab notebook with some, though by no means all, of our training and testing records. 
 
 To train the default CNN model in the Colab notebook: 
 ```
@@ -24,6 +24,7 @@ To train the transformer model:
   model=transformer user="single_user" \
   trainer.accelerator=gpu trainer.devices=1
 ```
+We have also added various graphing and visualization scripts to the `scripts` folder to generate loss curves and other useful analysis images from the logs generated during training. 
 
 ### Original Readme continued
 
