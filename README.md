@@ -5,6 +5,26 @@
 
 The files that we edited to test out both the default CNN on emg2qwerty as well as experiment with RNN, RNN+CNN, and CNN+Transformer hybrid architectures include `emg2qwery/lightning.py`, `emg2qwery/modules.py`, and new config files to easily train and test any of the new models under `config/model/`. We have also updated the .ipynb Colab notebook with some, though by no means all, of our training and testing records. 
 
+To train the default CNN model in the Colab notebook: 
+```
+!python -m emg2qwerty.train \
+  user="single_user" \
+  trainer.accelerator=gpu trainer.devices=1
+```
+
+To train our RNN model in the notebook: 
+```
+!python -m emg2qwerty.train \
+  model=rnn_ctc user="single_user" \
+  trainer.accelerator=gpu trainer.devices=1
+```
+To train the transformer model:
+```
+!python -m emg2qwerty.train \
+  user="single_user" \
+  trainer.accelerator=gpu trainer.devices=1
+```
+
 ### Original Readme continued
 
 This course project is built upon the emg2qwerty work from Meta. The first section of this README provides some guidance for working with the repo and contains a running list of FAQs.
