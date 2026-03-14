@@ -243,3 +243,127 @@ class SpecAugment:
 
         # (..., C, freq, T) -> (T, ..., C, freq)
         return x.movedim(-1, 0)
+
+@dataclass
+class ThresholdNoiseReduction:
+    """Applies noise reduction by identifying regions of silence based on some
+    threshold value, and then setting them to some pre-fixed value
+
+    Args:
+        threshold_mode (int): Type of silence threshold to use. 0 indicates using the mean,
+            1 using the midrange (max + min) / 2, and 2 indicates using a preset value.
+            (default: 0)
+        manual_threshold (float): Manual threshold. Only used if threshold_mode is 
+            set to 2. (default: 0.5)
+        silence_value (float): Value to set the silence to. (default: 0)
+    """
+
+    threshold_mode: int = 0
+    manual_threshold: float = 0.5
+    silence_value: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.threshold_mode not in [0, 1, 2]:
+            raise ValueError("threshold_mode must be 0, 1, or 2")
+
+    def __call__(self, emg: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            emg (torch.Tensor): EMG signal of shape (time, batch, electrode_channel).
+        Returns:
+            torch.Tensor: Normalized EMG signal.
+        """
+        output = emg.clone()        
+        mag = torch.abs(emg)
+
+        if self.threshold_mode == 0:
+            threshold = mag.mean(dim=(0, 2), keepdim=True)
+        elif self.threshold_mode == 1:
+            t_max = mag.max(dim=0)[0] 
+            t_min = mag.min(dim=0)[0] 
+            midrange = (t_max + t_min) / 2
+            threshold = midrange.unsqueeze(0)
+        else:
+            threshold = self.manual_threshold
+
+        silence_mask = mag < threshold
+        output[silence_mask] = self.silence_value
+
+        return output
+
+@dataclass
+class SigmoidNoiseReduction:
+    """Applies noise reduction based off a tunable sigmoid function to skew the 
+      EMG data close to the min and max values of each channel.
+
+    Args:
+        k (float): Hyperparameter for tunable sigmoid
+    """
+
+    k: float = 0
+
+    def __post_init__(self) -> None:
+        if self.k < -1 or self.k > 1:
+            raise ValueError("k must be between -1 and 1")
+
+    def __call__(self, emg: torch.Tensor) -> torch.Tensor:        
+        output = emg.clone()
+        mag = torch.abs(emg)      
+        a = torch.max(mag, dim = 0).values
+
+        def tuned_sigmoid(x):
+          return ((1 - self.k) * x) / (self.k * (1 - 2 * torch.abs(x)) + 1)
+        
+        output = a * tuned_sigmoid(output / a)
+
+        return output
+
+
+@dataclass
+class ToggleChannels:
+    """Adjusts the number of electrode channels in the EMG tensor.
+
+    If the target number of channels is smaller than the current number,
+    a subset of channels is selected. If it is larger, channels are repeated
+    until the desired size is reached.
+
+    Assumes input shape (time, batch, electrode_channel).
+
+    Args:
+        target_channels (int): Desired number of channels.
+        channel_dim (int): Dimension corresponding to electrode channels.
+            (default: -1)
+        random_select (bool): Whether to randomly select channels when
+            reducing channel count. If False, selects the first channels.
+    """
+
+    target_channels: int
+    channel_dim: int = -1
+    random_select: bool = True
+
+    def __post_init__(self) -> None:
+        if self.target_channels <= 0:
+            raise ValueError("target_channels must be > 0")
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        current_channels = tensor.shape[self.channel_dim]
+
+        # Case 1: already correct
+        if current_channels == self.target_channels:
+            return tensor
+
+        # Case 2: reduce channels
+        if current_channels > self.target_channels:
+            if self.random_select:
+                idx = torch.randperm(current_channels)[:self.target_channels]
+            else:
+                idx = torch.arange(self.target_channels)
+
+            return torch.index_select(tensor, self.channel_dim, idx)
+
+        # Case 3: increase channels
+        repeats = int(np.ceil(self.target_channels / current_channels))
+        expanded = tensor.repeat_interleave(repeats, dim=self.channel_dim)
+
+        return expanded.narrow(self.channel_dim, 0, self.target_channels)
+
