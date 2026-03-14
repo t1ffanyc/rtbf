@@ -23,6 +23,7 @@ from emg2qwerty.data import LabelData, WindowedEMGDataset
 from emg2qwerty.metrics import CharacterErrorRates
 from emg2qwerty.modules import (
     MultiBandRotationInvariantMLP,
+    RNNEncoder,
     SpectrogramNorm,
     TDSConvEncoder,
 )
@@ -137,6 +138,25 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         )
 
 
+class LSTMWrapper(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers)
+
+    def forward(self, x):
+        x, _ = self.lstm(x)
+        return x
+
+class TransformerWrapper(nn.Module):
+  def __init__(self, d_model, nhead=4, num_layers=2, dim_feedforward=None, dropout=0.1):
+    super().__init__()
+    transformer_encoder = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=False)
+    self.transformer = nn.TransformerEncoder(transformer_encoder, num_layers=num_layers)
+
+  def forward(self, x):
+    return self.transformer(x)
+
+
 class TDSConvCTCModule(pl.LightningModule):
     NUM_BANDS: ClassVar[int] = 2
     ELECTRODE_CHANNELS: ClassVar[int] = 16
@@ -158,6 +178,9 @@ class TDSConvCTCModule(pl.LightningModule):
 
         # Model
         # inputs: (T, N, bands=2, electrode_channels=16, freq)
+
+        # baseline model given to us in the original repo.
+        
         self.model = nn.Sequential(
             # (T, N, bands=2, C=16, freq)
             SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
@@ -178,6 +201,484 @@ class TDSConvCTCModule(pl.LightningModule):
             nn.Linear(num_features, charset().num_classes),
             nn.LogSoftmax(dim=-1),
         )
+
+        # rtbf model!
+        # self.model = nn.Sequential(
+        #     # (T, N, bands=2, C=16, freq)
+        #     SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+        #     # (T, N, bands=2, mlp_features[-1])
+        #     MultiBandRotationInvariantMLP(
+        #         in_features=in_features,
+        #         mlp_features=mlp_features,
+        #         num_bands=self.NUM_BANDS,
+        #     ),
+        #     # (T, N, num_features)
+        #     nn.Flatten(start_dim=2),
+        #     TDSConvEncoder(
+        #         num_features=num_features,
+        #         block_channels=block_channels,
+        #         kernel_width=kernel_width,
+        #     ),
+        #     # (T, N, num_classes)
+        #     nn.Linear(num_features, charset().num_classes),
+        #     nn.LogSoftmax(dim=-1),
+        # )
+
+
+        print("Model type: ")
+        print(self.model)
+
+        # Criterion
+        self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
+
+        # Decoder
+        self.decoder = instantiate(decoder)
+
+        # Metrics
+        metrics = MetricCollection([CharacterErrorRates()])
+        self.metrics = nn.ModuleDict(
+            {
+                f"{phase}_metrics": metrics.clone(prefix=f"{phase}/")
+                for phase in ["train", "val", "test"]
+            }
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.model(inputs)
+
+    def _step(
+        self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
+    ) -> torch.Tensor:
+        inputs = batch["inputs"]
+        targets = batch["targets"]
+        input_lengths = batch["input_lengths"]
+        target_lengths = batch["target_lengths"]
+        N = len(input_lengths)  # batch_size
+
+        emissions = self.forward(inputs)
+
+        # Shrink input lengths by an amount equivalent to the conv encoder's
+        # temporal receptive field to compute output activation lengths for CTCLoss.
+        # NOTE: This assumes the encoder doesn't perform any temporal downsampling
+        # such as by striding.
+        T_diff = inputs.shape[0] - emissions.shape[0]
+        emission_lengths = input_lengths - T_diff
+
+        loss = self.ctc_loss(
+            log_probs=emissions,  # (T, N, num_classes)
+            targets=targets.transpose(0, 1),  # (T, N) -> (N, T)
+            input_lengths=emission_lengths,  # (N,)
+            target_lengths=target_lengths,  # (N,)
+        )
+
+        # Decode emissions
+        predictions = self.decoder.decode_batch(
+            emissions=emissions.detach().cpu().numpy(),
+            emission_lengths=emission_lengths.detach().cpu().numpy(),
+        )
+
+        # Update metrics
+        metrics = self.metrics[f"{phase}_metrics"]
+        targets = targets.detach().cpu().numpy()
+        target_lengths = target_lengths.detach().cpu().numpy()
+        for i in range(N):
+            # Unpad targets (T, N) for batch entry
+            target = LabelData.from_labels(targets[: target_lengths[i], i])
+            metrics.update(prediction=predictions[i], target=target)
+
+        self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
+        return loss
+
+    def _epoch_end(self, phase: str) -> None:
+        metrics = self.metrics[f"{phase}_metrics"]
+        self.log_dict(metrics.compute(), sync_dist=True)
+        metrics.reset()
+
+    def training_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("train", *args, **kwargs)
+
+    def validation_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("val", *args, **kwargs)
+
+    def test_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("test", *args, **kwargs)
+
+    def on_train_epoch_end(self) -> None:
+        self._epoch_end("train")
+
+    def on_validation_epoch_end(self) -> None:
+        self._epoch_end("val")
+
+    def on_test_epoch_end(self) -> None:
+        self._epoch_end("test")
+
+    def configure_optimizers(self) -> dict[str, Any]:
+        return utils.instantiate_optimizer_and_scheduler(
+            self.parameters(),
+            optimizer_config=self.hparams.optimizer,
+            lr_scheduler_config=self.hparams.lr_scheduler,
+        )
+
+
+
+class RNNCTCModule(pl.LightningModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        hidden_size: int,
+        num_layers: int,
+        bidirectional: bool,
+        dropout: float,
+        rnn_type: str,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        selected_channels_per_band: int | None = None,  # <-- new
+    ) -> None:
+        super().__init__()
+        self.save_hyperparameters()
+        self.selected_channels_per_band = selected_channels_per_band or self.ELECTRODE_CHANNELS
+
+        num_features = self.NUM_BANDS * mlp_features[-1]
+        rnn_out_features = hidden_size * (2 if bidirectional else 1)
+
+        self.model = nn.Sequential(
+            SpectrogramNorm(
+                channels=self.NUM_BANDS * self.selected_channels_per_band
+            ),
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            nn.Flatten(start_dim=2),
+            RNNEncoder(
+                num_features=num_features,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                bidirectional=bidirectional,
+                dropout=dropout,
+                rnn_type=rnn_type,
+            ),
+            nn.Linear(rnn_out_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+        self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
+        self.decoder = instantiate(decoder)
+        metrics = MetricCollection([CharacterErrorRates()])
+        self.metrics = nn.ModuleDict({
+            f"{phase}_metrics": metrics.clone(prefix=f"{phase}/")
+            for phase in ["train", "val", "test"]
+        })
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.model(inputs)
+
+    def _step(
+        self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
+    ) -> torch.Tensor:
+        inputs = batch["inputs"]
+        targets = batch["targets"]
+        input_lengths = batch["input_lengths"]
+        target_lengths = batch["target_lengths"]
+        N = len(input_lengths)  # batch_size
+
+        emissions = self.forward(inputs)
+
+        # Shrink input lengths by an amount equivalent to the conv encoder's
+        # temporal receptive field to compute output activation lengths for CTCLoss.
+        # NOTE: This assumes the encoder doesn't perform any temporal downsampling
+        # such as by striding.
+        T_diff = inputs.shape[0] - emissions.shape[0]
+        emission_lengths = input_lengths - T_diff
+
+        loss = self.ctc_loss(
+            log_probs=emissions,  # (T, N, num_classes)
+            targets=targets.transpose(0, 1),  # (T, N) -> (N, T)
+            input_lengths=emission_lengths,  # (N,)
+            target_lengths=target_lengths,  # (N,)
+        )
+
+        # Decode emissions
+        predictions = self.decoder.decode_batch(
+            emissions=emissions.detach().cpu().numpy(),
+            emission_lengths=emission_lengths.detach().cpu().numpy(),
+        )
+
+        # Update metrics
+        metrics = self.metrics[f"{phase}_metrics"]
+        targets = targets.detach().cpu().numpy()
+        target_lengths = target_lengths.detach().cpu().numpy()
+        for i in range(N):
+            # Unpad targets (T, N) for batch entry
+            target = LabelData.from_labels(targets[: target_lengths[i], i])
+            metrics.update(prediction=predictions[i], target=target)
+
+        self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
+        return loss
+
+    def _epoch_end(self, phase: str) -> None:
+        metrics = self.metrics[f"{phase}_metrics"]
+        self.log_dict(metrics.compute(), sync_dist=True)
+        metrics.reset()
+
+    def training_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("train", *args, **kwargs)
+
+    def validation_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("val", *args, **kwargs)
+
+    def test_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("test", *args, **kwargs)
+
+    def on_train_epoch_end(self) -> None:
+        self._epoch_end("train")
+
+    def on_validation_epoch_end(self) -> None:
+        self._epoch_end("val")
+
+    def on_test_epoch_end(self) -> None:
+        self._epoch_end("test")
+
+    def configure_optimizers(self) -> dict[str, Any]:
+        return utils.instantiate_optimizer_and_scheduler(
+            self.parameters(),
+            optimizer_config=self.hparams.optimizer,
+            lr_scheduler_config=self.hparams.lr_scheduler,
+        )
+
+
+class CRNNCTCModule(pl.LightningModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        hidden_size: int,
+        num_layers: int,
+        bidirectional: bool,
+        dropout: float,
+        rnn_type: str,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        # New CNN-specific parameters
+        conv_channels: int = 64,
+        kernel_size: int = 5,
+    ) -> None:
+        super().__init__()
+        self.save_hyperparameters()
+
+        # Input to MLP
+        num_mlp_out = self.NUM_BANDS * mlp_features[-1]
+        
+        # RNN Input size calculation
+        rnn_out_features = hidden_size * (2 if bidirectional else 1)
+
+        self.feature_extractor = nn.Sequential(
+            # 1. NORMALIZE
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            
+            # 2. POINTWISE MLP (Muscle signature extraction)
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            nn.Flatten(start_dim=2), # Output shape: (T, N, num_mlp_out)
+        )
+
+        # 3. CONVOLUTIONAL LAYER (The "C" in CRNN)
+        # We use a 1D Conv across the time dimension (T)
+        # We need to permute to (N, C, T) for Conv1d, then back to (T, N, C)
+        self.temporal_cnn = nn.Sequential(
+            nn.Conv1d(
+                in_channels=num_mlp_out, 
+                out_channels=conv_channels, 
+                kernel_size=kernel_size, 
+                padding=kernel_size // 2
+            ),
+            nn.BatchNorm1d(conv_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+        # 4. RECURRENT LAYER (The "R" in CRNN)
+        self.rnn = RNNEncoder(
+            num_features=conv_channels, # Now receiving CNN features
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bidirectional=bidirectional,
+            dropout=dropout,
+            rnn_type=rnn_type,
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(rnn_out_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+        # Loss, Decoder, and Metrics remain identical to your current code...
+        self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
+        self.decoder = instantiate(decoder)
+
+        # Metrics
+        metrics = MetricCollection([CharacterErrorRates()])
+        self.metrics = nn.ModuleDict(
+            {
+                f"{phase}_metrics": metrics.clone(prefix=f"{phase}/")
+                for phase in ["train", "val", "test"]
+            }
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (T, N, Bands, Channels, Freq)
+        
+        # MLP Stage
+        x = self.feature_extractor(x)  # (T, N, D_mlp)
+        
+        # CNN Stage (Requires Permute for Conv1d: Batch-First, Channels-Middle)
+        x = x.permute(1, 2, 0)         # (N, D_mlp, T)
+        x = self.temporal_cnn(x)       # (N, conv_channels, T)
+        x = x.permute(2, 0, 1)         # (T, N, conv_channels)
+        
+        # RNN Stage
+        x = self.rnn(x)                # (T, N, rnn_out)
+        
+        # Output
+        return self.classifier(x)
+
+    def _step(
+        self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
+    ) -> torch.Tensor:
+        inputs = batch["inputs"]
+        targets = batch["targets"]
+        input_lengths = batch["input_lengths"]
+        target_lengths = batch["target_lengths"]
+        N = len(input_lengths)  # batch_size
+
+        emissions = self.forward(inputs)
+
+        # Shrink input lengths by an amount equivalent to the encoder's temporal
+        # receptive field to compute output activation lengths for CTCLoss.
+        # NOTE: This assumes the encoder doesn't perform any temporal downsampling
+        # such as by striding.
+        T_diff = inputs.shape[0] - emissions.shape[0]
+        emission_lengths = input_lengths - T_diff
+
+        loss = self.ctc_loss(
+            log_probs=emissions,  # (T, N, num_classes)
+            targets=targets.transpose(0, 1),  # (T, N) -> (N, T)
+            input_lengths=emission_lengths,  # (N,)
+            target_lengths=target_lengths,  # (N,)
+        )
+
+        # Decode emissions
+        predictions = self.decoder.decode_batch(
+            emissions=emissions.detach().cpu().numpy(),
+            emission_lengths=emission_lengths.detach().cpu().numpy(),
+        )
+
+        # Update metrics
+        metrics = self.metrics[f"{phase}_metrics"]
+        targets = targets.detach().cpu().numpy()
+        target_lengths = target_lengths.detach().cpu().numpy()
+        for i in range(N):
+            # Unpad targets (T, N) for batch entry
+            target = LabelData.from_labels(targets[: target_lengths[i], i])
+            metrics.update(prediction=predictions[i], target=target)
+
+        self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
+        return loss
+
+    def _epoch_end(self, phase: str) -> None:
+        metrics = self.metrics[f"{phase}_metrics"]
+        self.log_dict(metrics.compute(), sync_dist=True)
+        metrics.reset()
+
+    def training_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("train", *args, **kwargs)
+
+    def validation_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("val", *args, **kwargs)
+
+    def test_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("test", *args, **kwargs)
+
+    def on_train_epoch_end(self) -> None:
+        self._epoch_end("train")
+
+    def on_validation_epoch_end(self) -> None:
+        self._epoch_end("val")
+
+    def on_test_epoch_end(self) -> None:
+        self._epoch_end("test")
+
+    def configure_optimizers(self) -> dict[str, Any]:
+        return utils.instantiate_optimizer_and_scheduler(
+            self.parameters(),
+            optimizer_config=self.hparams.optimizer,
+            lr_scheduler_config=self.hparams.lr_scheduler,
+        )
+
+
+
+  
+class TransformerCTCModule(pl.LightningModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+    ) -> None:
+        super().__init__()
+        self.save_hyperparameters()
+
+        num_features = self.NUM_BANDS * mlp_features[-1]
+
+        # Model
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+       
+        # CNN + transformer
+        self.model = nn.Sequential(
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+
+            nn.Flatten(start_dim=2),
+
+            TDSConvEncoder(
+                num_features=num_features,
+                block_channels=block_channels,
+                kernel_width=kernel_width,
+            ),
+
+            TransformerWrapper(d_model=num_features, nhead=8, num_layers=4, dim_feedforward=4*num_features, dropout=0.1),
+
+            nn.Linear(num_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+        print("Model type: ")
+        print(self.model)
 
         # Criterion
         self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
