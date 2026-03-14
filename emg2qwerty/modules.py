@@ -278,3 +278,74 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+
+class TDSConvRNNEncoder(nn.Module):
+    def __init__(
+        self,
+        num_features,
+        block_channels=(24,24,24,24),
+        kernel_width=32,
+        rnn_hidden_size=256,
+        rnn_layers=2,
+    ):
+        super().__init__()
+
+        self.tds = TDSConvEncoder(
+            num_features=num_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width,
+        )
+
+        self.rnn = RNNEncoder(
+            input_size=num_features,
+            hidden_size=rnn_hidden_size,
+            num_layers=rnn_layers,
+        )
+
+    def forward(self, inputs):
+        x = self.tds(inputs)
+        x = self.rnn(x)
+        return x
+
+
+class RNNEncoder(nn.Module):
+    """An RNN encoder (LSTM/GRU) that maps a sequence of feature vectors to a
+    sequence of hidden states.
+
+    Inputs are expected to have shape (T, N, num_features) and outputs have
+    shape (T, N, out_features), where out_features is ``hidden_size`` (or
+    ``2 * hidden_size`` if bidirectional).
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        hidden_size: int = 256,
+        num_layers: int = 2,
+        bidirectional: bool = True,
+        dropout: float = 0.1,
+        rnn_type: str = "lstm",
+    ) -> None:
+        super().__init__()
+
+        assert rnn_type in {"lstm", "gru"}, f"Unsupported rnn_type: {rnn_type}"
+        rnn_cls = nn.LSTM if rnn_type == "lstm" else nn.GRU
+
+        # PyTorch applies dropout only between stacked layers (num_layers > 1).
+        self.rnn = rnn_cls(
+            input_size=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
+            batch_first=False,
+        )
+
+    @property
+    def out_features(self) -> int:
+        return self.rnn.hidden_size * (2 if self.rnn.bidirectional else 1)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        outputs, _ = self.rnn(inputs)
+        return outputs  # (T, N, out_features)
