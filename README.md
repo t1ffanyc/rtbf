@@ -21,7 +21,7 @@ To train our RNN model in the notebook:
 To train the transformer model:
 ```
 !python -m emg2qwerty.train \
-  user="single_user" \
+  model=transformer user="single_user" \
   trainer.accelerator=gpu trainer.devices=1
 ```
 
